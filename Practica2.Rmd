@@ -1,0 +1,158 @@
+---
+title: "Detección Bayesiana de un Efecto Débil con Apoyo de Priors Informativas"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(tidyverse)
+options(mc.cores = parallel::detectCores())
+color_scheme_set("red")
+```
+
+## Introducción
+
+En este ejercicio exploramos cómo la inferencia bayesiana, al incorporar conocimiento previo creíble, puede detectar un efecto real débil que un modelo clásico podría pasar por alto. Nos basamos en la literatura económica sobre el retorno de la educación.
+
+## Contexto Económico
+
+Supongamos que el retorno promedio por cada año adicional de educación formal se sitúa entre el 6% y el 10% en salarios. Es decir, el salario esperado crece en torno al 8–10% por año de educación:
+
+\[
+\beta \approx \log(1.10) \approx 0.095
+\]
+
+También se sabe que los datos de educación suelen tener error de medición de ±1 año, lo que introduce sesgos hacia cero (atenuación) en modelos clásicos.
+
+## Simulación de Datos con Efecto Débil y Error Fuerte
+
+Simulamos un conjunto de datos con un verdadero efecto de la educación del 10% y una observación con error de medición severo.
+
+```{r simulate-data, include=FALSE}
+set.seed(123)
+N <- 30
+educ_true <- round(runif(N, 8, 16))  # años de educación real entre 8 y 16
+beta <- log(1.10)  # efecto real ~10%
+alpha <- log(1000)
+sigma <- 0.3
+
+# Error severo: desviación de 2.5 años
+educ_obs <- educ_true + rnorm(N, 0, 2.5)
+
+log_wage <- rnorm(N, mean = alpha + beta * educ_true, sd = sigma)
+wage <- exp(log_wage)
+
+data <- tibble(wage, log_wage, educ_obs, educ_true)
+
+# Visualizamos
+ggplot(data, aes(x = educ_obs, y = wage)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(x = "Años de educación observados", y = "Salario")
+```
+
+## Formulación del modelo generativo
+
+Modelo bayesiano:
+
+\[
+\log(wage_i) \sim \mathcal{N}(\alpha + \beta \cdot educ_i,\ \sigma^2)
+\]
+
+Priors basados en la literatura:
+
+\[
+\begin{aligned}
+\alpha &\sim \mathcal{N}(7, 2^2) \\
+\beta &\sim \mathcal{N}(0.095, 0.02^2) \\
+\sigma &\sim \text{Cauchy}^+(0, 2)
+\end{aligned}
+\]
+
+- La prior para \( \beta \) refleja que, antes de ver los datos, creemos que el retorno de la educación está **cercano al 9.5%**, y es poco probable que sea mucho mayor o menor (el intervalo de ±2 SD cubre aproximadamente entre 5.5% y 13.5%).
+- Esta prior **no fuerza** el resultado, pero sí **acentúa nuestra expectativa previa**, lo cual es útil si tenemos **muestras pequeñas** o **ruido considerable**.
+
+
+## Código del Modelo en Stan
+
+```{r stan-code}
+stan_code <- "
+data {
+  int<lower=0> N;
+  vector[N] log_wage;
+  vector[N] educ;
+}
+parameters {
+  real alpha;
+  real beta;
+  real<lower=0> sigma;
+}
+model {
+  alpha ~ normal(7, 2);
+  beta ~ normal(0.095, 0.02);
+  sigma ~ cauchy(0, 2);
+  log_wage ~ normal(alpha + beta * educ, sigma);
+}
+"
+```
+
+## Ajuste del Modelo Bayesiano
+
+```{r fit-model}
+stan_data <- list(N = N, log_wage = data$log_wage, educ = data$educ_obs)
+model <- cmdstan_model(write_stan_file(stan_code), cpp_options = list(stan_threads = TRUE))
+fit <- model$sample(
+  data = stan_data,
+  chains = 4,
+  parallel_chains = 4,
+  threads_per_chain = 2,
+  iter_sampling = 2000,
+  iter_warmup = 500,
+  seed = 123
+)
+fit$print(variables = c("alpha", "beta", "sigma"))
+```
+
+## Comparación con el Modelo Clásico
+
+```{r lm-model}
+lm_fit <- lm(log(wage) ~ educ_obs, data = data)
+summary(lm_fit)
+```
+
+## Interpretación Numérica
+
+```{r interpret}
+beta_draws <- fit$draws(variables = "beta", format = "df")
+exp_beta <- exp(beta_draws$beta)
+quantile(exp_beta, probs = c(0.025, 0.5, 0.975))
+```
+
+Este intervalo creíble muestra el crecimiento esperado del salario por cada año adicional de educación. Si el modelo clásico no detecta un efecto significativo, pero el modelo bayesiano sí, es evidencia del valor de incorporar priors basados en conocimiento previo.
+
+## Visualización Comparativa
+
+```{r posterior-plot}
+ci_lm <- confint(lm_fit)["educ_obs", ]
+point_lm <- coef(lm_fit)["educ_obs"]
+
+mcmc_areas(beta_draws, pars = "beta", prob = 0.95) +
+  vline_at(log(1.10), linetype = "dashed", color = "black") +
+  vline_at(point_lm, linetype = "dotted", color = "red") +
+  geom_segment(aes(x = ci_lm[1], xend = ci_lm[2], y = 0, yend = 0),
+               color = "red", size = 1.5, inherit.aes = FALSE) +
+  labs(title = "Distribución posterior de beta vs. estimación clásica",
+       subtitle = "Línea negra: valor real (log(1.10)); Línea roja: modelo clásico")
+```
+
+## Discusión Final
+
+- ¿Por qué el modelo bayesiano puede detectar un efecto que el modelo clásico no?
+- ¿Qué papel jugó la prior en este caso?
+- ¿Qué pasa si usamos una prior más débil (por ejemplo, `beta ~ normal(0, 1)`)?
