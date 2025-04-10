@@ -1,5 +1,5 @@
 ---
-title: "Detección Bayesiana de un Efecto Débil con Apoyo de Priors Informativas"
+title: "Detección Bayesiana de un Efecto Débil con Apoyo de Priors Informativos"
 output:
   html_document:
     toc: true
@@ -16,13 +16,15 @@ options(mc.cores = parallel::detectCores())
 color_scheme_set("red")
 ```
 
-## Introducción
+# Introducción
 
 En este ejercicio exploramos cómo la inferencia bayesiana, al incorporar conocimiento previo creíble, puede detectar un efecto real débil que un modelo clásico podría pasar por alto. Nos basamos en la literatura económica sobre el retorno de la educación.
 
-## Contexto Económico
+## Contexto del problema: Retornos de la educación
 
-Supongamos que el retorno promedio por cada año adicional de educación formal se sitúa entre el 6% y el 10% en salarios. Es decir, el salario esperado crece en torno al 8–10% por año de educación:
+Supongamos que el retorno promedio por cada año adicional de educación formal se sitúa entre el 6% y el 10% en salarios. Es decir, el salario esperado crece en torno al 6–10% por año de educación:
+
+El efecto en escala logarítmica sería: 
 
 \[
 \beta \approx \log(1.10) \approx 0.095
@@ -57,6 +59,15 @@ ggplot(data, aes(x = educ_obs, y = wage)) +
   labs(x = "Años de educación observados", y = "Salario")
 ```
 
+# Flujo de trabajo en inferencia bayesiana:
+
+- Especificación del modelo generativo: verosimilitud y distribuciones a priori
+- Chequeos a priori predictivos
+- Estimación del modelo
+- Evaluación de la convergencia del modelo: R-hat y ESS
+- Chequeos predictivos posteriores
+- Inferencia
+
 ## Formulación del modelo generativo
 
 Modelo bayesiano:
@@ -75,9 +86,65 @@ Priors basados en la literatura:
 \end{aligned}
 \]
 
-- La prior para \( \beta \) refleja que, antes de ver los datos, creemos que el retorno de la educación está **cercano al 9.5%**, y es poco probable que sea mucho mayor o menor (el intervalo de ±2 SD cubre aproximadamente entre 5.5% y 13.5%).
-- Esta prior **no fuerza** el resultado, pero sí **acentúa nuestra expectativa previa**, lo cual es útil si tenemos **muestras pequeñas** o **ruido considerable**.
+- El prior para \( \beta \) refleja que, antes de ver los datos, creemos que el retorno de la educación está **cercano al 9.5%**, y es poco probable que sea mucho mayor o menor (el intervalo de ±2 SD cubre aproximadamente entre 5.5% y 13.5%).
+- Como hemos visto este prior **no fuerza** el resultado, pero sí **acentúa nuestra expectativa previa**, lo cual es útil si tenemos **muestras pequeñas** o **ruido considerable**.
 
+## Chequeo a priori predictivo (Prior predictive check)
+
+## Chequeo Predictivo A Priori
+
+Antes de observar los datos, podemos simular resultados únicamente a partir de los priors especificados. Esto nos permite verificar si los valores que generan son plausibles en el contexto del problema (por ejemplo, log-salarios realistas).
+
+## Chequeo Predictivo A Priori (Modelo Completo)
+
+Antes de ajustar el modelo, verificamos si las predicciones generadas **exclusivamente a partir de los priors** producen valores realistas de log-salario. Esto nos permite detectar si nuestros priors generan escenarios extremos o poco plausibles.
+
+```{r prior-predictive-full}
+# Número de simulaciones desde la distribución a priori
+set.seed(123)
+n_sim <- 100  # número de repeticiones
+N_sim <- 30   # número de observaciones por repetición (como en el modelo real)
+
+# Simulaciones: para cada simulación generamos N observaciones completas
+prior_pred <- map_dfr(1:n_sim, function(i) {
+  alpha_i <- rnorm(1, 7, 2)
+  beta_i <- rnorm(1, 0.095, 0.02)
+  sigma_i <- abs(rcauchy(1, 0, 2))
+
+  # Simulamos educación observada (valores plausibles)
+  educ_i <- round(runif(N_sim, 8, 16))
+
+  # Generamos log(salario)
+  log_wage_i <- rnorm(N_sim, mean = alpha_i + beta_i * educ_i, sd = sigma_i)
+
+  tibble(
+    sim = i,
+    educ = educ_i,
+    log_wage = log_wage_i,
+    wage = exp(log_wage_i)
+  )
+})
+
+# Gráfico: densidad de log(salario) simulado
+ggplot(prior_pred, aes(x = log_wage, group = sim)) +
+  geom_density(alpha = 0.2, color = "red") + 
+  labs(
+    title = "Chequeo Predictivo A Priori",
+    subtitle = "Densidades de log(salario) generadas solo con priors",
+    x = "log(Salario)",
+    y = "Densidad"
+  )
+
+ggplot(prior_pred, aes(x = log_wage, group = sim)) +
+    geom_density(alpha = 0.2, color = "steelblue") +
+  coord_cartesian(xlim = c(-1, 20)) +
+  labs(
+    title = "Chequeo Predictivo A Priori",
+    subtitle = "Densidades de log(salario) generadas solo con priors",
+    x = "log(Salario)",
+    y = "Densidad"
+  )
+```
 
 ## Código del Modelo en Stan
 
@@ -119,11 +186,36 @@ fit <- model$sample(
 fit$print(variables = c("alpha", "beta", "sigma"))
 ```
 
-## Comparación con el Modelo Clásico
+## Chequeo Predictivo Posterior
 
-```{r lm-model}
-lm_fit <- lm(log(wage) ~ educ_obs, data = data)
-summary(lm_fit)
+Evaluamos si el modelo ajustado reproduce razonablemente bien los datos observados. Para ello, generamos réplicas de los datos (`log_wage`) a partir de la distribución posterior y las comparamos visualmente con los datos reales.
+
+```{r posterior-predictive-check, message=FALSE}
+# Extraer draws
+posterior_draws <- as_draws_matrix(fit$draws())
+
+# Extraer parámetros
+alpha_draws <- posterior_draws[, "alpha"]
+beta_draws <- posterior_draws[, "beta"]
+sigma_draws <- posterior_draws[, "sigma"]
+
+# Generar predicciones posteriores para cada observación (usando los primeros 100 draws)
+set.seed(123)
+n_draws <- 100
+log_wage_rep <- matrix(NA, nrow = n_draws, ncol = N)
+
+for (i in 1:n_draws) {
+  mu <- alpha_draws[i] + beta_draws[i] * data$educ_obs
+  log_wage_rep[i, ] <- rnorm(N, mean = mu, sd = sigma_draws[i])
+}
+
+# Chequeo predictivo gráfico
+ppc_dens_overlay(y = data$log_wage, yrep = log_wage_rep) +
+  labs(
+    title = "Chequeo Predictivo Posterior",
+    subtitle = "¿El modelo puede generar datos como los observados?",
+    x = "log(Salario)", y = "Densidad"
+  )
 ```
 
 ## Interpretación Numérica
@@ -135,6 +227,13 @@ quantile(exp_beta, probs = c(0.025, 0.5, 0.975))
 ```
 
 Este intervalo creíble muestra el crecimiento esperado del salario por cada año adicional de educación. Si el modelo clásico no detecta un efecto significativo, pero el modelo bayesiano sí, es evidencia del valor de incorporar priors basados en conocimiento previo.
+
+## Comparación con el Modelo Clásico
+
+```{r lm-model}
+lm_fit <- lm(log(wage) ~ educ_obs, data = data)
+summary(lm_fit)
+```
 
 ## Visualización Comparativa
 
@@ -149,6 +248,87 @@ mcmc_areas(beta_draws, pars = "beta", prob = 0.95) +
                color = "red", size = 1.5, inherit.aes = FALSE) +
   labs(title = "Distribución posterior de beta vs. estimación clásica",
        subtitle = "Línea negra: valor real (log(1.10)); Línea roja: modelo clásico")
+```
+
+# Estimación con `brms()`
+
+## Estimación Alternativa con `brms`
+
+En esta sección repetimos el ajuste del modelo bayesiano, pero usando `brms`, que proporciona una interfaz más sencilla para definir modelos bayesianos con sintaxis tipo `lm`. Usamos los mismos priors informativos que en el modelo original.
+
+Utilizamos los mismos priors:
+
+ - Intercepto normal(7, 2)
+ - Efecto de educación: normal(0.095, 0.02)
+ - Desviación estándar: Cauchy+ con centro 0 y escala 2
+
+```{r brms-model, message=FALSE, warning=FALSE}
+# Cargar la librería
+library(brms)
+
+priors <- c(
+  prior(normal(7, 2), class = "Intercept"),
+  prior(normal(0.095, 0.02), class = "b"),
+  prior(cauchy(0, 2), class = "sigma")
+)
+
+brms_fit <- brm(
+  formula = log(wage) ~ educ_obs,
+  data = data,
+  family = gaussian(),
+  prior = priors,
+  seed = 123,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  warmup = 500,
+  backend = "cmdstanr"
+)
+```
+
+```{r}
+brms_fit
+```
+
+## Comparar posterior con línea negra (valor real), y estimación clásica en rojo
+
+Para ello convertimos el objeto brms_fit (que contiene las muestras posteriores del modelo ajustado con brms) en un data frame compatible con la librería posterior, que se puede usar para graficar con bayesplot.
+
+Después se grafica la distribución posterior del coeficiente de educación (b_educ_obs) como un área sombreada.
+
+```{r}
+posterior_samples <- as_draws_df(brms_fit)
+
+mcmc_areas(posterior_samples, pars = "b_educ_obs", prob = 0.95) +
+  vline_at(log(1.10), linetype = "dashed", color = "black") +
+  vline_at(point_lm, linetype = "dotted", color = "red") +
+  geom_segment(aes(x = ci_lm[1], xend = ci_lm[2], y = 0, yend = 0),
+               color = "red", size = 1.5, inherit.aes = FALSE) +
+  labs(title = "Estimación de `brms` vs. modelo clásico",
+       subtitle = "Línea negra: valor real (log(1.10)); Línea roja: modelo clásico")
+
+```
+
+## Comparación brms y stan en crudo
+
+Primero extraemos las muestras de beta del modelo cmdstanr. Después, hacemos lo mismo para b_educ_obs del modelo brms. Finalmente, calculamos los intervalos creíbles al 95%. 
+
+```{r}
+beta_cmdstanr <- fit$draws(variables = "beta", format = "df")$beta
+
+
+beta_brms <- posterior_samples$b_educ_obs
+
+interval_cmdstanr <- quantile(beta_cmdstanr, probs = c(0.025, 0.5, 0.975))
+interval_brms <- quantile(beta_brms, probs = c(0.025, 0.5, 0.975))
+
+# Construir tabla
+tibble(
+  Modelo = c("cmdstanr", "brms"),
+  `2.5%` = c(interval_cmdstanr[1], interval_brms[1]),
+  `Mediana` = c(interval_cmdstanr[2], interval_brms[2]),
+  `97.5%` = c(interval_cmdstanr[3], interval_brms[3])
+)
 ```
 
 ## Discusión Final

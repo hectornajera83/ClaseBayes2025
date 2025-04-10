@@ -1,0 +1,165 @@
+---
+title: "Modelado Bayesiano con Variables Categóricas: Ventajas frente al Logit Clásico"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(brms)
+library(bayesplot)
+library(cmdstanr)
+library(posterior)
+theme_set(theme_minimal())
+set.seed(123)
+```
+
+## Simulación de Datos con Categoría Rara
+
+```{r simulate-data, include=FALSE}
+N <- 150
+partido <- sample(c("izquierda", "centro", "derecha", "otro"), size = N,
+                  replace = TRUE, prob = c(0.4, 0.4, 0.18, 0.02))
+partido <- factor(partido, levels = c("centro", "izquierda", "derecha", "otro"))
+
+# Coeficientes verdaderos (log-odds)
+b <- c(centro = 0, izquierda = 1, derecha = -0.5, otro = 3)
+
+# Probabilidad de voto
+eta <- b[as.character(partido)]
+p <- plogis(eta)
+voto <- rbinom(N, size = 1, prob = p)
+
+data <- tibble(partido, voto)
+
+# Mostrar conteo por categoría
+table(data$partido, data$voto)
+```
+
+## Modelo Logit Clásico
+
+```{r classic-logit}
+glm_fit <- glm(voto ~ partido, data = data, family = binomial())
+summary(glm_fit)
+```
+
+## Problema de Separación y Estimaciones Inestables
+
+```{r classic-coefs}
+coef(summary(glm_fit))
+```
+
+Cuando la categoría "otro" tiene pocos casos y todos votan (o ninguno), el modelo clásico puede producir **coeficientes extremadamente grandes o infinitos**, generando errores o estimaciones inestables.
+
+## Modelo Bayesiano con `brms`
+
+```{r bayes-model}
+# Priors débilmente informativos:
+# Normal(0, 2.5) sobre los coeficientes log-odds
+# Esto refleja la creencia de que los efectos pueden ser positivos o negativos,
+# pero probablemente no extremos (log-odds entre -5 y 5 implican odds entre ~0.007 y ~150).
+
+prior <- prior(normal(0, 2.5), class = "b")
+
+brms_fit <- brm(
+  voto ~ partido,
+  data = data,
+  family = bernoulli(),
+  prior = prior,
+  chains = 4, cores = 4,
+  iter = 1500, warmup = 500,
+  seed = 123,
+  backend = "cmdstanr"
+)
+```
+
+## Modelo Bayesiano con `cmdstanr` directamente
+
+```{r stan-model}
+# Convertir variable categórica a diseño de matriz
+X <- model.matrix(~ partido, data = data)[, -1]  # quitar intercepto
+stan_data <- list(
+  N = nrow(data),
+  K = ncol(X),
+  X = X,
+  y = data$voto
+)
+
+stan_code <- "
+data {
+  int<lower=0> N;
+  int<lower=0> K;
+  matrix[N, K] X;
+  array[N] int<lower=0, upper=1> y;
+}
+parameters {
+  vector[K] beta;
+}
+model {
+  beta ~ normal(0, 2.5);
+  y ~ bernoulli_logit(X * beta);
+}
+"
+
+model_stan <- cmdstan_model(write_stan_file(stan_code))
+fit_stan <- model_stan$sample(
+  data = stan_data,
+  chains = 4,
+  parallel_chains = 4,
+  iter_sampling = 2000,
+  iter_warmup = 500,
+  seed = 123
+)
+fit_stan$summary()
+```
+
+## Chequeo Predictivo Posterior (Posterior Predictive Check)
+
+```{r ppc-brms}
+# Generamos replicaciones posteriores
+pp_check(brms_fit, type = "bars", nsamples = 100) +
+  labs(title = "Chequeo Predictivo Posterior para el modelo de brms")
+```
+
+```{r ppc-stan}
+# Predicciones a partir del modelo en cmdstanr
+# Extraer muestras de beta en formato matriz
+beta_draws <- fit_stan$draws("beta", format = "matrix")  # [draws, K]
+
+# Calcular predicciones para cada observación y muestra
+pred_matrix <- beta_draws %*% t(X)  # [draws, N]
+
+# Convertir a probabilidades
+p_matrix <- plogis(pred_matrix)  # [draws, N]
+
+# Simular resultados binarios
+yrep <- apply(p_matrix, c(1, 2), function(p) rbinom(1, 1, p))  # [draws, N]
+
+# Seleccionar un subconjunto (e.g., 100 replicaciones)
+yrep_subset <- yrep[1:100, ]
+
+# Visualización con bayesplot
+ppc_bars(y = data$voto, yrep = yrep_subset) +
+  labs(title = "Chequeo Predictivo Posterior para el modelo en Stan")
+
+```
+
+## Comparación de Coeficientes
+
+```{r compare-coefs}
+posterior <- as_draws_df(brms_fit)
+mcmc_areas(posterior, pars = c("b_partidoizquierda", "b_partidoderecha", "b_partidootro"), prob = 0.95) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(title = "Distribuciones Posteriores de los Coeficientes",
+       subtitle = "El modelo bayesiano regulariza estimaciones inestables")
+```
+
+## Interpretación
+
+- El modelo clásico puede colapsar con **separación completa** o **categorías con pocos casos**.
+- El modelo bayesiano **evita este problema** mediante el uso de **priors débilmente informativos**, que actúan como una forma de regularización.
+- En contextos con datos escasos o desequilibrios, el enfoque bayesiano proporciona **inferencias más estables y creíbles**.
+
+

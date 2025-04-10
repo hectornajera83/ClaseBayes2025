@@ -175,6 +175,64 @@ abline(h = 0, lty = 2)
 
 **Interpretación:** El modelo clásico `lm()` asume varianza constante. En el gráfico de residuos se puede observar que, para niveles bajos de educación, los residuos tienden a ser más dispersos, lo que indica **heterocedasticidad no capturada** por el modelo clásico. Esto muestra una limitación importante frente a la flexibilidad del enfoque bayesiano.
 
+```{r}
+# Valores secuenciales de educación para predecir
+educ_grid <- tibble(educ = seq(8, 16, length.out = 100))
+
+### Modelo clásico: predicción + intervalo de predicción
+pred_lm <- predict(lm_fit, newdata = educ_grid, interval = "prediction", level = 0.95)
+educ_grid <- educ_grid %>%
+  mutate(
+    fit_lm = pred_lm[, "fit"],
+    lwr_lm = pred_lm[, "lwr"],
+    upr_lm = pred_lm[, "upr"]
+  )
+
+### Modelo bayesiano: usamos draws para generar predicciones posteriores
+draws <- fit$draws(format = "df")
+alpha_draws <- draws$alpha
+beta_draws <- draws$beta
+gamma_0_draws <- draws$gamma_0
+gamma_1_draws <- draws$gamma_1
+
+# Creamos una matriz de predicciones para cada punto de la grilla
+set.seed(123)
+n_draws <- 500  # cantidad de muestras a usar para predicción
+pred_matrix <- sapply(educ_grid$educ, function(e) {
+  mu <- alpha_draws[1:n_draws] + beta_draws[1:n_draws] * e
+  sigma <- exp(gamma_0_draws[1:n_draws] + gamma_1_draws[1:n_draws] * e)
+  rnorm(n_draws, mu, sigma)
+})
+
+# Extraemos percentiles para construir el intervalo de predicción
+pred_quantiles <- apply(pred_matrix, 2, quantile, probs = c(0.025, 0.5, 0.975))
+
+educ_grid <- educ_grid %>%
+  mutate(
+    lwr_bayes = pred_quantiles[1, ],
+    fit_bayes = pred_quantiles[2, ],
+    upr_bayes = pred_quantiles[3, ]
+  )
+
+
+ggplot(data, aes(x = educ, y = log_wage)) +
+  geom_point(alpha = 0.4) +
+  geom_ribbon(data = educ_grid, aes(x = educ, ymin = lwr_lm, ymax = upr_lm), 
+              fill = "red", alpha = 0.2, inherit.aes = FALSE) +
+  geom_line(data = educ_grid, aes(x = educ, y = fit_lm), 
+            color = "red", linetype = "dashed", inherit.aes = FALSE) +
+  geom_ribbon(data = educ_grid, aes(x = educ, ymin = lwr_bayes, ymax = upr_bayes), 
+              fill = "blue", alpha = 0.2, inherit.aes = FALSE) +
+  geom_line(data = educ_grid, aes(x = educ, y = fit_bayes), 
+            color = "blue", inherit.aes = FALSE) +
+  labs(
+    title = "Comparación de Intervalos de Predicción",
+    subtitle = "Rojo: modelo clásico (varianza constante); Azul: modelo bayesiano (varianza flexible)",
+    y = "log(Salario)", x = "Años de educación"
+  )
+```
+
+
 ## Discusión
 
 - El modelo clásico asume varianza constante y no puede capturar la heterocedasticidad.
